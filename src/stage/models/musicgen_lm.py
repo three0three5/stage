@@ -1,15 +1,15 @@
 from pathlib import Path
 from torch import nn, Tensor
 import torch
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Union
 import x_transformers as xt
 
 from stage.conditioning.condition_type import ConditionType
 from stage.conditioning.conditioning_method import ConditioningMethod
 from stage.conditioning.embedded_condition import EmbeddedCondition
 from stage import hyperparameters as hp
-from stage.utils.inspection import printshape
 from stage import config as cfg
+from stage.models.lm_cache import LmInferenceCache, position_for_timestep
 
 
 class ResidualTokenEmbedding(nn.Module):
@@ -242,16 +242,22 @@ class MusicgenLm(nn.Module):
                                         emb[k].  # type: ignore
                                         weight[0])
 
-    def forward(
+    def _unpack_conditions(
         self,
         x: Tensor,
-        attention_mask: Tensor,
-        cross_attention_input: Optional[EmbeddedCondition] = None,
-        prepend_embeds: Optional[EmbeddedCondition] = None,
-        sum_embeds: Optional[EmbeddedCondition] = None,
-    ) -> Tensor:
-
-        # unpack cross_attention
+        cross_attention_input: Optional[EmbeddedCondition],
+        prepend_embeds: Optional[EmbeddedCondition],
+        sum_embeds: Optional[EmbeddedCondition],
+    ) -> Tuple[
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        int,
+    ]:
+        """Returns cross/prepend/sum tensors and prepend length."""
         if cross_attention_input is not None:
             cross_attention_data = cross_attention_input.data
             cross_attention_mask = cross_attention_input.mask
@@ -309,48 +315,185 @@ class MusicgenLm(nn.Module):
             if sum_embeds_mask is not None:
                 sum_embeds_data[~sum_embeds_mask] = 0
 
-        assert attention_mask.shape == torch.Size([x.shape[0], x.shape[-1]])
+        prepend_len = prepend_embeds_data.shape[-2] if prepend_embeds_data is not None else 0
+        return (
+            cross_attention_data,
+            cross_attention_mask,
+            prepend_embeds_data,
+            prepend_embeds_mask,
+            sum_embeds_data,
+            sum_embeds_mask,
+            prepend_len,
+        )
 
-        # create manually positional embedding indices
+    def _compute_positions(
+        self,
+        attention_mask: Tensor,
+        prepend_len: int,
+    ) -> Tuple[Tensor, Tensor]:
         positions = torch.zeros_like(attention_mask, dtype=torch.int64)
-        B, S = positions.shape
+        b, s = positions.shape
         first_valid_indices = torch.argmax(attention_mask.long(), dim=-1)
-        sequence = torch.arange(S, device=positions.device).unsqueeze(0).expand(
-            B, S)
-        mask = torch.arange(S, device=positions.device).unsqueeze(
+        sequence = torch.arange(s, device=positions.device).unsqueeze(0).expand(
+            b, s)
+        valid = torch.arange(s, device=positions.device).unsqueeze(
             0) >= first_valid_indices.unsqueeze(1)
-        positions[mask] = (sequence - first_valid_indices.unsqueeze(1))[mask]
+        positions[valid] = (sequence - first_valid_indices.unsqueeze(1))[valid]
         positions = positions.unsqueeze(-1)
+        if prepend_len > 0:
+            positions = positions + prepend_len
+        return positions, first_valid_indices
 
-        # create mask
-        mask = torch.ones((x.shape[0], x.shape[-1]),
-                          dtype=torch.bool,
-                          device=x.device)
+    def _decoder_forward(
+        self,
+        x: Tensor,
+        attention_mask: Optional[Tensor],
+        positions: Tensor,
+        cross_attention_data: Optional[Tensor],
+        cross_attention_mask: Optional[Tensor],
+        prepend_embeds_data: Optional[Tensor],
+        prepend_embeds_mask: Optional[Tensor],
+        sum_embeds_data: Optional[Tensor],
+        prepend_len: int,
+        cache: Optional[LmInferenceCache] = None,
+        return_cache: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, LmInferenceCache]]:
+        layer_cache = cache.layer_intermediates if cache is not None else None
+        use_kv = layer_cache is not None
+        # x-transformers: cached decode cannot use padding masks
+        mask = None if use_kv else attention_mask
 
-        # positional embeddings are manually applied to prepend data
-        # if not self.cross_attend and prepend_embeds_data is not None:
+        decoder_kwargs = dict(
+            context=cross_attention_data,
+            context_mask=cross_attention_mask,
+            prepend_embeds=prepend_embeds_data if not use_kv else None,
+            prepend_mask=prepend_embeds_mask if not use_kv else None,
+            sum_embeds=sum_embeds_data,
+            pos=positions,
+            cache=layer_cache,
+        )
+
+        if return_cache or use_kv:
+            logits, intermediates = self.decoder(
+                x,
+                mask=mask,
+                return_intermediates=True,
+                **decoder_kwargs,
+            )
+            if use_kv and cache is not None:
+                cache.layer_intermediates = intermediates
+        else:
+            logits = self.decoder(x, mask=mask, **decoder_kwargs)
+
+        if prepend_len > 0 and not use_kv:
+            logits = logits[:, :, prepend_len:, :]
+
+        if return_cache:
+            new_cache = LmInferenceCache(
+                layer_intermediates=intermediates,
+                prepend_len=prepend_len,
+                first_valid_indices=None,
+                cross_attention_data=cross_attention_data,
+                cross_attention_mask=cross_attention_mask,
+                sum_embeds_data=sum_embeds_data,
+            )
+            return logits, new_cache
+        return logits
+
+    def forward(
+        self,
+        x: Tensor,
+        attention_mask: Tensor,
+        cross_attention_input: Optional[EmbeddedCondition] = None,
+        prepend_embeds: Optional[EmbeddedCondition] = None,
+        sum_embeds: Optional[EmbeddedCondition] = None,
+        return_cache: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, LmInferenceCache]]:
+        (
+            cross_attention_data,
+            cross_attention_mask,
+            prepend_embeds_data,
+            prepend_embeds_mask,
+            sum_embeds_data,
+            _sum_mask,
+            prepend_len,
+        ) = self._unpack_conditions(x, cross_attention_input, prepend_embeds,
+                                    sum_embeds)
+
+        assert attention_mask.shape == torch.Size([x.shape[0], x.shape[-1]])
+        positions, first_valid = self._compute_positions(attention_mask,
+                                                         prepend_len)
+
         if prepend_embeds_data is not None:
-            positions += prepend_embeds_data.shape[-2]
             prepend_embeds_data = prepend_embeds_data + self.decoder.pos_emb(
                 prepend_embeds_data[..., 0].unsqueeze(1))
 
-        # forward through decoder
-        logits = self.decoder(
+        result = self._decoder_forward(
             x,
-            # mask=mask,
-            mask=attention_mask,
-            pos=positions,
-            context=cross_attention_data,
-            context_mask=cross_attention_mask,
-            prepend_embeds=prepend_embeds_data,
-            prepend_mask=prepend_embeds_mask,
-            sum_embeds=sum_embeds_data,
+            attention_mask,
+            positions,
+            cross_attention_data,
+            cross_attention_mask,
+            prepend_embeds_data,
+            prepend_embeds_mask,
+            sum_embeds_data,
+            prepend_len,
+            cache=None,
+            return_cache=return_cache,
         )
-        # if something is prepended to the input, remove it from the logits
-        if prepend_embeds_data is not None:
-            logits = logits[:, :, prepend_embeds_data.shape[-2]:, :]
+        if return_cache:
+            logits, new_cache = result  # type: ignore
+            new_cache.first_valid_indices = first_valid
+            return logits, new_cache
+        return result
 
-        return logits
+    def prefill(
+        self,
+        x: Tensor,
+        attention_mask: Tensor,
+        cross_attention_input: Optional[EmbeddedCondition] = None,
+        prepend_embeds: Optional[EmbeddedCondition] = None,
+        sum_embeds: Optional[EmbeddedCondition] = None,
+    ) -> Tuple[Tensor, LmInferenceCache]:
+        """Run one full-prefix forward and return logits + KV cache."""
+        logits, cache = self.forward(
+            x,
+            attention_mask,
+            cross_attention_input=cross_attention_input,
+            prepend_embeds=prepend_embeds,
+            sum_embeds=sum_embeds,
+            return_cache=True,
+        )
+        return logits, cache  # type: ignore
+
+    def decode_step(
+        self,
+        x: Tensor,
+        cache: LmInferenceCache,
+        timestep: int,
+    ) -> Tensor:
+        """Single-timestep forward using an existing KV cache.
+
+        Args:
+            x: Token slice ``[..., timestep:timestep+1]`` with shape ``[B, K, 1]``.
+            timestep: Absolute index in the interleaved sequence.
+        """
+        assert cache.first_valid_indices is not None
+        positions = position_for_timestep(timestep, cache.first_valid_indices,
+                                          cache.prepend_len, x.device)
+        return self._decoder_forward(
+            x,
+            None,
+            positions,
+            cache.cross_attention_data,
+            cache.cross_attention_mask,
+            None,
+            None,
+            cache.sum_embeds_data,
+            cache.prepend_len,
+            cache=cache,
+            return_cache=False,
+        )
 
 
 if __name__ == "__main__":

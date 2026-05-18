@@ -32,6 +32,42 @@ To run code in this repo, you need to:
 
 Follow the example in `src/stage/inference.py` to test inference with any model.
 
+## Local inference on Mac (optimized path)
+
+The repo includes an inference-focused runtime with **KV-cache autoregressive decoding**, automatic **MPS** device selection on Apple Silicon, and optional FP16.
+
+```python
+from stage.inference_config import InferenceConfig
+from stage.runtime.inference_engine import StageInferenceEngine
+
+cfg = InferenceConfig(
+    use_kv_cache=True,   # prefill + incremental decode (largest speedup)
+    use_fp16=True,       # recommended on M-series
+    t5_on_cpu=True,      # stable default when LM runs on MPS
+    compile_decode=False,  # set True after first run for extra speed
+)
+engine = StageInferenceEngine.from_checkpoint("checkpoints/stage-drums.safetensors", cfg)
+audio = engine.generate(n_samples=1, gen_seconds=10, context=wav, description=["heavy rock drums"])
+```
+
+Benchmark wall time / RTF:
+
+```bash
+python -m stage.benchmark_inference --checkpoint checkpoints/stage-drums.safetensors --gen-seconds 10
+```
+
+Compare with KV-cache disabled:
+
+```bash
+python -m stage.benchmark_inference --no-kv-cache
+```
+
+Run KV-cache parity tests (no weights required):
+
+```bash
+python -m pytest tests/test_kv_cache_parity.py -v
+```
+
 
 # Data:
 

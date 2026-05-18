@@ -28,6 +28,8 @@ from stage.utils.audio import load_audio, save_audio
 from stage.utils.inspection import sanity_check
 from stage.utils.sample import eval_decorator, sample_top_k
 from stage import config as cfg
+from stage.inference_config import InferenceConfig
+from stage.models.lm_cache import LmInferenceCache
 
 
 class LightningMusicgen(L.LightningModule):
@@ -279,57 +281,49 @@ class LightningMusicgen(L.LightningModule):
 
         return cross_entropy_loss
 
-    def sample_next_token(
-            self, current_sequence: Tensor, attention_mask: Tensor,
-            method_to_cond: Dict[ConditioningMethod,
-                                 EmbeddedCondition]) -> Tensor:
-
-        if not current_sequence.isfinite().all():
-            if current_sequence.isnan().any():
-                print(f"Before forward pass some logits are nan")
-            else:
-                print(f"Before forward pass some logits are not finite")
-
-        # call language model
-        logits: Tensor = self.lm(
-            x=current_sequence,
-            attention_mask=attention_mask,
-            cross_attention_input=method_to_cond.get(
-                ConditioningMethod.CROSS_ATTENTION),
-            prepend_embeds=method_to_cond.get(ConditioningMethod.INPUT_PREPEND),
-            sum_embeds=method_to_cond.get(ConditioningMethod.INPUT_SUM),
-        )
-
-        if not logits.isfinite().all():
-            if logits.isnan().any():
-                print(f"After forward pass some logits are nan")
-            else:
-                print(f"After forward pass some logits are not finite")
-
-        # classifier-free guidance
-        cond_logits, uncond_logits = logits.split(
-            current_sequence.shape[0] // 2,
-            dim=0,
-        )
-        logits = uncond_logits + (cond_logits - uncond_logits) * 3.0
-
-        # get logits for last token
-        logits = logits.permute(0, 1, 3, 2)  # B, K, card, T
-        logits = logits[..., -1]  # B, K, card,
-
-        # apply softmax
+    def _logits_to_next_token(self, logits: Tensor, n_cond_batch: int,
+                              inference_cfg: InferenceConfig) -> Tensor:
+        cond_logits, uncond_logits = logits.split(n_cond_batch, dim=0)
+        logits = uncond_logits + (cond_logits -
+                                  uncond_logits) * inference_cfg.cfg_coef
+        logits = logits.permute(0, 1, 3, 2)[..., -1]
         probs = torch.softmax(logits, dim=-1)
+        return sample_top_k(probs, k=inference_cfg.top_k)
 
-        # sample
-        next_token = sample_top_k(probs, k=250)
-        return next_token
+    def sample_next_token(
+            self,
+            current_sequence: Tensor,
+            attention_mask: Tensor,
+            method_to_cond: Dict[ConditioningMethod, EmbeddedCondition],
+            inference_cfg: Optional[InferenceConfig] = None,
+            kv_cache: Optional[LmInferenceCache] = None,
+            timestep: Optional[int] = None,
+    ) -> Tensor:
+        inference_cfg = inference_cfg or InferenceConfig()
+
+        if kv_cache is not None:
+            assert timestep is not None
+            logits = self.lm.decode_step(current_sequence, kv_cache, timestep)
+        else:
+            logits = self.lm(
+                x=current_sequence,
+                attention_mask=attention_mask,
+                cross_attention_input=method_to_cond.get(
+                    ConditioningMethod.CROSS_ATTENTION),
+                prepend_embeds=method_to_cond.get(
+                    ConditioningMethod.INPUT_PREPEND),
+                sum_embeds=method_to_cond.get(ConditioningMethod.INPUT_SUM),
+            )
+
+        return self._logits_to_next_token(logits, current_sequence.shape[0] //
+                                         2, inference_cfg)
 
     def predict_step(self, batch):
         batch["prog_bar"] = False
         return self.generate(**batch)
 
-    # @torch.inference_mode()
     @eval_decorator
+    @torch.inference_mode()
     @torch.no_grad()
     def generate(self,
                  n_samples: int,
@@ -340,7 +334,8 @@ class LightningMusicgen(L.LightningModule):
                  beat: Optional[List[Beat]],
                  description: Optional[List[str]],
                  context_dropout_mask: Optional[Tensor] = None,
-                 prog_bar: bool = False) -> Tensor:
+                 prog_bar: bool = False,
+                 inference_cfg: Optional[InferenceConfig] = None) -> Tensor:
         """Run autoregressive generation
 
         Args:
@@ -412,34 +407,56 @@ class LightningMusicgen(L.LightningModule):
         method_to_cond: Dict[ConditioningMethod,
                              EmbeddedCondition] = self.condition_dispatcher(
                                  processed_conditions)
-        # autoregression
+        inference_cfg = inference_cfg or InferenceConfig()
+        kv_cache: Optional[LmInferenceCache] = None
+        use_kv = inference_cfg.use_kv_cache and start_offset > 0
 
-        iterator = range(start_offset, gen_sequence.shape[-1])
+        if use_kv:
+            prefix = gen_sequence[..., :start_offset]
+            prefix_mask = attention_mask[..., :start_offset]
+            logits, kv_cache = self.lm.prefill(
+                prefix,
+                prefix_mask,
+                cross_attention_input=method_to_cond.get(
+                    ConditioningMethod.CROSS_ATTENTION),
+                prepend_embeds=method_to_cond.get(
+                    ConditioningMethod.INPUT_PREPEND),
+                sum_embeds=method_to_cond.get(ConditioningMethod.INPUT_SUM),
+            )
+            next_token = self._logits_to_next_token(logits, n_samples,
+                                                    inference_cfg)
+            self._write_token_at_offset(gen_sequence, gen_mask, n_samples,
+                                        start_offset, next_token)
+
+        iterator = range(
+            start_offset + 1 if use_kv else start_offset,
+            gen_sequence.shape[-1],
+        )
         if prog_bar:
             iterator = tqdm(iterator, desc="generating autoregressively...")
 
         for offset in iterator:
-            current_sequence = gen_sequence[..., :offset]
-            current_mask = attention_mask[..., :offset]
-            next_token = self.sample_next_token(current_sequence, current_mask,
-                                                method_to_cond)
-            valid_mask = gen_mask[
-                ...,  # TODO: I can't figure out if this is correct or if it matters at all anyways
-                offset:offset + 1].expand(n_samples, -1, -1)
-            next_token[~valid_mask] = self.special_token
-            gen_sequence[:n_samples, :, offset:offset + 1] = torch.where(
-                gen_sequence[:n_samples, :, offset:offset + 1] == -1,
-                next_token,
-                gen_sequence[:n_samples, :, offset:offset + 1],
-            )
-            gen_sequence[n_samples:, :, offset:offset + 1] = torch.where(
-                gen_sequence[n_samples:, :, offset:offset + 1] == -1,
-                next_token,
-                gen_sequence[n_samples:, :, offset:offset + 1],
-            )
-
-            if prog_bar and torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if use_kv and kv_cache is not None:
+                current_sequence = gen_sequence[..., offset - 1:offset]
+                next_token = self.sample_next_token(
+                    current_sequence,
+                    attention_mask[..., offset - 1:offset],
+                    method_to_cond,
+                    inference_cfg=inference_cfg,
+                    kv_cache=kv_cache,
+                    timestep=offset - 1,
+                )
+            else:
+                current_sequence = gen_sequence[..., :offset]
+                current_mask = attention_mask[..., :offset]
+                next_token = self.sample_next_token(
+                    current_sequence,
+                    current_mask,
+                    method_to_cond,
+                    inference_cfg=inference_cfg,
+                )
+            self._write_token_at_offset(gen_sequence, gen_mask, n_samples,
+                                        offset, next_token)
 
         assert not (gen_sequence == -1).any()
         gen_sequence = gen_sequence[:gen_sequence.shape[0] // 2]
@@ -455,6 +472,24 @@ class LightningMusicgen(L.LightningModule):
         with torch.no_grad():
             out_audio = self.encodec_model.decode(out_codes)
         return out_audio
+
+    def _write_token_at_offset(
+        self,
+        gen_sequence: Tensor,
+        gen_mask: Tensor,
+        n_samples: int,
+        offset: int,
+        next_token: Tensor,
+    ) -> None:
+        valid_mask = gen_mask[..., offset:offset + 1].expand(n_samples, -1, -1)
+        next_token = next_token.clone()
+        next_token[~valid_mask] = self.special_token
+        for batch_slice in (slice(n_samples), slice(n_samples, None)):
+            gen_sequence[batch_slice, :, offset:offset + 1] = torch.where(
+                gen_sequence[batch_slice, :, offset:offset + 1] == -1,
+                next_token,
+                gen_sequence[batch_slice, :, offset:offset + 1],
+            )
 
     @staticmethod
     def load_from_checkpoint_replacing_paths(ckp_path: Path | str):

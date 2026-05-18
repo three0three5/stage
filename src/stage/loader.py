@@ -19,9 +19,10 @@ def _configure_attn_flash(model: LightningMusicgen, enabled: bool) -> None:
 
 
 def _configure_t5_device(model: LightningMusicgen, t5_on_cpu: bool) -> None:
-    embedder = model.condition_provider.embedders.get("description")
-    if embedder is None:
+    embedders = model.condition_provider.embedders
+    if "description" not in embedders:
         return
+    embedder = embedders["description"]
     if t5_on_cpu and hasattr(embedder, "t5"):
         embedder.t5 = embedder.t5.cpu()
 

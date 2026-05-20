@@ -7,3 +7,6 @@ wandb/
 lightning_logs/
 .DS_Store
 lag/
+.idea
+.venv
+outputs

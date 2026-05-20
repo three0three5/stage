@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from stage.conditioning.embedded_condition import EmbeddedCondition
+from stage.models.lm_cache import cached_kv_seq_len
 from stage.models.musicgen_lm import MusicgenLm
 
 
@@ -184,6 +185,46 @@ def test_kv_cache_matches_full_forward_delayed_mask() -> None:
             rtol=1e-4,
             atol=1e-5,
         ), f"Delayed-mask decode step {step} diverged"
+
+
+@torch.no_grad()
+def test_kv_mask_stays_aligned_with_cache_past_max_seq_len() -> None:
+    """Regression: self_attn_kv_mask length must match cached K/V (flash-attn)."""
+    torch.manual_seed(4)
+    lm = _make_tiny_lm()
+    lm.decoder.max_seq_len = 24  # force trim after ~20 decode steps, not 500
+
+    b, k, t = 2, 4, 32
+    card = lm.card
+    x = _random_batch(b, k, t, card)
+    mask = torch.ones(b, t, dtype=torch.bool)
+    prepend_len = 1
+    prepend = EmbeddedCondition(
+        data=torch.randn(b, prepend_len, lm.dim),
+        mask=torch.zeros(b, prepend_len, dtype=torch.bool),
+    )
+
+    prefix_len = 14
+    _, cache = lm.prefill(
+        x[..., :prefix_len],
+        mask[:, :prefix_len],
+        prepend_embeds=prepend,
+    )
+    assert cache.key_valid_mask is not None
+
+    for step in range(prefix_len, t):
+        lm.decode_step(
+            x[..., step:step + 1],
+            cache,
+            timestep=step,
+            attention_mask=mask,
+        )
+        kv_len = cached_kv_seq_len(cache.layer_intermediates)
+        assert kv_len is not None
+        assert cache.key_valid_mask is not None
+        assert cache.key_valid_mask.shape[-1] == kv_len, (
+            f"step {step}: mask {cache.key_valid_mask.shape[-1]} != kv {kv_len}"
+        )
 
 
 @torch.no_grad()

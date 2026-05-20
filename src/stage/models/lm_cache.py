@@ -49,6 +49,38 @@ def position_for_timestep(
     return pos.view(-1, 1, 1).to(device=device)
 
 
+def cached_kv_seq_len(layer_intermediates: Any) -> Optional[int]:
+    """Length of cached K along the sequence axis (first layer with ``cached_kv``)."""
+    attn = getattr(layer_intermediates, "attn_intermediates", None)
+    if attn is None:
+        return None
+    for inter in attn:
+        cached_kv = getattr(inter, "cached_kv", None)
+        if cached_kv is not None:
+            return cached_kv[0].shape[-2]
+    return None
+
+
+def align_key_mask_to_cached_kv(
+    key_mask: Tensor,
+    layer_intermediates: Any,
+    query_len: int,
+) -> Tensor:
+    """Match ``key_mask`` length to cached K/V plus current query tokens (flash-attn)."""
+    kv_len = cached_kv_seq_len(layer_intermediates)
+    if kv_len is None:
+        return key_mask
+    target_len = kv_len + query_len
+    mask_len = key_mask.shape[-1]
+    if mask_len == target_len:
+        return key_mask
+    if mask_len > target_len:
+        return key_mask[:, -target_len:]
+    raise RuntimeError(
+        f"key_valid_mask length {mask_len} is shorter than KV+query length "
+        f"{target_len} (kv_len={kv_len}, query_len={query_len})")
+
+
 def trim_kv_cache_intermediates(layer_intermediates: Any, max_seq_len: int) -> None:
     """Trim cached K/V to the last ``max_seq_len - 1`` positions (x-transformers convention)."""
     attn = getattr(layer_intermediates, "attn_intermediates", None)

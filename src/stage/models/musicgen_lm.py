@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 from torch import nn, Tensor
 import torch
@@ -9,7 +11,11 @@ from stage.conditioning.conditioning_method import ConditioningMethod
 from stage.conditioning.embedded_condition import EmbeddedCondition
 from stage import hyperparameters as hp
 from stage import config as cfg
-from stage.models.lm_cache import LmInferenceCache, position_for_timestep
+from stage.models.lm_cache import (
+    LmInferenceCache,
+    position_for_timestep,
+    trim_kv_cache_intermediates,
+)
 
 
 class ResidualTokenEmbedding(nn.Module):
@@ -344,6 +350,17 @@ class MusicgenLm(nn.Module):
             positions = positions + prepend_len
         return positions, first_valid_indices
 
+    @staticmethod
+    def _build_key_valid_mask(
+        attention_mask: Tensor,
+        prepend_mask: Optional[Tensor],
+        seq_len: int,
+    ) -> Tensor:
+        seq_part = attention_mask[:, :seq_len]
+        if prepend_mask is not None and prepend_mask.shape[-1] > 0:
+            return torch.cat([prepend_mask, seq_part], dim=-1)
+        return seq_part
+
     def _decoder_forward(
         self,
         x: Tensor,
@@ -357,10 +374,19 @@ class MusicgenLm(nn.Module):
         prepend_len: int,
         cache: Optional[LmInferenceCache] = None,
         return_cache: bool = False,
+        kv_key_mask: Optional[Tensor] = None,
     ) -> Union[Tensor, Tuple[Tensor, LmInferenceCache]]:
         layer_cache = cache.layer_intermediates if cache is not None else None
         use_kv = layer_cache is not None
-        # x-transformers: cached decode cannot use padding masks
+        max_seq_len = self.decoder.max_seq_len
+        if use_kv and layer_cache is not None:
+            trim_kv_cache_intermediates(layer_cache, max_seq_len)
+            if cache is not None and cache.key_valid_mask is not None:
+                max_cache_len = max_seq_len - 1
+                if cache.key_valid_mask.shape[-1] > max_cache_len:
+                    cache.key_valid_mask = cache.key_valid_mask[
+                        :, -max_cache_len:]
+        # x-transformers: ``mask`` is disallowed with cache; use self_attn_kv_mask instead.
         mask = None if use_kv else attention_mask
 
         decoder_kwargs = dict(
@@ -372,6 +398,8 @@ class MusicgenLm(nn.Module):
             pos=positions,
             cache=layer_cache,
         )
+        if use_kv and kv_key_mask is not None:
+            decoder_kwargs["self_attn_kv_mask"] = kv_key_mask
 
         if return_cache or use_kv:
             logits, intermediates = self.decoder(
@@ -381,7 +409,10 @@ class MusicgenLm(nn.Module):
                 **decoder_kwargs,
             )
             if use_kv and cache is not None:
+                # x-transformers 1.26+ returns cumulative K/V in cached_kv; assign as-is.
                 cache.layer_intermediates = intermediates
+                trim_kv_cache_intermediates(cache.layer_intermediates,
+                                            max_seq_len)
         else:
             logits = self.decoder(x, mask=mask, **decoder_kwargs)
 
@@ -389,6 +420,13 @@ class MusicgenLm(nn.Module):
             logits = logits[:, :, prepend_len:, :]
 
         if return_cache:
+            key_valid_mask = None
+            if attention_mask is not None:
+                key_valid_mask = self._build_key_valid_mask(
+                    attention_mask,
+                    prepend_embeds_mask,
+                    attention_mask.shape[-1],
+                )
             new_cache = LmInferenceCache(
                 layer_intermediates=intermediates,
                 prepend_len=prepend_len,
@@ -396,8 +434,15 @@ class MusicgenLm(nn.Module):
                 cross_attention_data=cross_attention_data,
                 cross_attention_mask=cross_attention_mask,
                 sum_embeds_data=sum_embeds_data,
+                key_valid_mask=key_valid_mask,
             )
             return logits, new_cache
+        if use_kv and cache is not None and kv_key_mask is not None:
+            cache.key_valid_mask = kv_key_mask
+            trim_kv_cache_intermediates(cache.layer_intermediates, max_seq_len)
+            max_cache_len = max_seq_len - 1
+            if cache.key_valid_mask.shape[-1] > max_cache_len:
+                cache.key_valid_mask = cache.key_valid_mask[:, -max_cache_len:]
         return logits
 
     def forward(
@@ -471,19 +516,37 @@ class MusicgenLm(nn.Module):
         x: Tensor,
         cache: LmInferenceCache,
         timestep: int,
+        attention_mask: Tensor,
     ) -> Tensor:
         """Single-timestep forward using an existing KV cache.
 
         Args:
             x: Token slice ``[..., timestep:timestep+1]`` with shape ``[B, K, 1]``.
             timestep: Absolute index in the interleaved sequence.
+            attention_mask: Full-sequence mask ``[B, T]`` (used for cached key padding).
         """
         assert cache.first_valid_indices is not None
         positions = position_for_timestep(timestep, cache.first_valid_indices,
                                           cache.prepend_len, x.device)
+        new_bit = attention_mask[:, timestep:timestep + 1]
+        if cache.key_valid_mask is not None:
+            kv_key_mask = torch.cat([cache.key_valid_mask, new_bit], dim=-1)
+        elif cache.prepend_len > 0:
+            kv_key_mask = self._build_key_valid_mask(
+                attention_mask,
+                torch.ones(
+                    attention_mask.shape[0],
+                    cache.prepend_len,
+                    dtype=torch.bool,
+                    device=attention_mask.device,
+                ),
+                timestep + 1,
+            )
+        else:
+            kv_key_mask = attention_mask[:, :timestep + 1]
         return self._decoder_forward(
             x,
-            None,
+            attention_mask,
             positions,
             cache.cross_attention_data,
             cache.cross_attention_mask,
@@ -493,6 +556,7 @@ class MusicgenLm(nn.Module):
             cache.prepend_len,
             cache=cache,
             return_cache=False,
+            kv_key_mask=kv_key_mask,
         )
 
 

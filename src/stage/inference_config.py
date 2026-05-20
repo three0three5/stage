@@ -36,6 +36,8 @@ class InferenceConfig:
     t5_on_cpu: bool = True
     device: Optional[str] = None
     attn_flash: Optional[bool] = None  # None = auto (off on mps)
+    greedy: bool = False  # argmax sampling (deterministic parity tests)
+    verify_kv_parity: bool = False  # ref forward + resync each step (debug only)
 
     def resolved_device(self) -> torch.device:
         return resolve_device(self.device)

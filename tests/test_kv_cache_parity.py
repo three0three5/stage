@@ -1,14 +1,30 @@
 """Parity between full-prefix forward and KV-cache prefill/decode."""
 
+from dataclasses import dataclass
+from typing import Optional
+
+import pytest
 import torch
 
 from stage.conditioning.embedded_condition import EmbeddedCondition
-from stage.hyperparameters import LmParams
 from stage.models.musicgen_lm import MusicgenLm
 
 
+@dataclass
+class _TinyLmParams:
+    """Minimal LM params (avoids importing hyperparameters / data stack)."""
+    dim: int
+    n_layers: int
+    n_heads: int
+    card: int = 2048
+    padding_token: Optional[int] = 2048
+    sep_token: Optional[int] = None
+    cross_attend: bool = True
+    weights: Optional[str] = None
+
+
 def _make_tiny_lm() -> MusicgenLm:
-    params = LmParams(
+    params = _TinyLmParams(
         dim=128,
         n_layers=2,
         n_heads=4,
@@ -57,20 +73,117 @@ def test_kv_cache_matches_full_forward() -> None:
     )
 
     assert torch.allclose(
-        full_logits[..., :prefix_len],
+        full_logits[:, :, :prefix_len, :],
         prefill_logits,
         rtol=1e-4,
         atol=1e-5,
     ), "Prefill logits must match full forward on prefix"
 
     for step in range(prefix_len, t):
-        step_logits = lm.decode_step(x[..., step:step + 1], cache, timestep=step)
+        step_logits = lm.decode_step(
+            x[..., step:step + 1],
+            cache,
+            timestep=step,
+            attention_mask=mask,
+        )
         assert torch.allclose(
-            full_logits[..., step:step + 1],
+            full_logits[:, :, step:step + 1, :],
             step_logits,
             rtol=1e-4,
             atol=1e-5,
         ), f"Decode step {step} diverged from full forward"
+
+
+@torch.no_grad()
+def test_kv_cache_with_prepend_embeddings() -> None:
+    """Prefill + incremental decode matches full forward with INPUT_PREPEND."""
+    torch.manual_seed(2)
+    lm = _make_tiny_lm()
+    b, k, t = 2, 4, 12
+    card = lm.card
+
+    x = _random_batch(b, k, t, card)
+    mask = torch.ones(b, t, dtype=torch.bool)
+    prepend_len = 4
+    prepend = EmbeddedCondition(
+        data=torch.randn(b, prepend_len, lm.dim),
+        mask=torch.ones(b, prepend_len, dtype=torch.bool),
+    )
+
+    full_logits = lm(x, mask, prepend_embeds=prepend)
+
+    prefix_len = 7
+    prefill_logits, cache = lm.prefill(
+        x[..., :prefix_len],
+        mask[:, :prefix_len],
+        prepend_embeds=prepend,
+    )
+    assert torch.allclose(
+        full_logits[:, :, :prefix_len, :],
+        prefill_logits,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    for step in range(prefix_len, t):
+        step_logits = lm.decode_step(
+            x[..., step:step + 1],
+            cache,
+            timestep=step,
+            attention_mask=mask,
+        )
+        assert torch.allclose(
+            full_logits[:, :, step:step + 1, :],
+            step_logits,
+            rtol=1e-4,
+            atol=1e-5,
+        ), f"Decode step {step} diverged with prepend embeddings"
+
+
+@torch.no_grad()
+def test_kv_cache_matches_full_forward_delayed_mask() -> None:
+    """Prefill + decode with interleaved-style sparse attention_mask."""
+    torch.manual_seed(3)
+    lm = _make_tiny_lm()
+    b, k, t = 2, 4, 20
+    card = lm.card
+
+    x = _random_batch(b, k, t, card)
+    gen_mask = torch.ones(b, k, t, dtype=torch.bool)
+    for s in range(t):
+        for qi in range(k):
+            if s < qi + 1:
+                gen_mask[:, qi, s] = False
+    attention_mask = gen_mask.any(dim=1)
+    x = torch.where(gen_mask, x, torch.full_like(x, 2048))
+
+    full_logits = lm(x, attention_mask)
+
+    prefix_len = 12
+    prefill_logits, cache = lm.prefill(
+        x[..., :prefix_len],
+        attention_mask[:, :prefix_len],
+    )
+    assert torch.allclose(
+        full_logits[:, :, :prefix_len, :],
+        prefill_logits,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    for step in range(prefix_len, t):
+        step_logits = lm.decode_step(
+            x[..., step:step + 1],
+            cache,
+            timestep=step,
+            attention_mask=attention_mask,
+        )
+        assert torch.allclose(
+            full_logits[:, :, step:step + 1, :],
+            step_logits,
+            rtol=1e-4,
+            atol=1e-5,
+        ), f"Delayed-mask decode step {step} diverged"
 
 
 @torch.no_grad()
@@ -80,4 +193,4 @@ def test_kv_cache_disabled_path_unchanged() -> None:
     x = _random_batch(1, 4, 8, lm.card)
     mask = torch.ones(1, 8, dtype=torch.bool)
     out = lm(x, mask)
-    assert out.shape[-2] == 8
+    assert out.shape[2] == 8

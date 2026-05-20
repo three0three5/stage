@@ -85,13 +85,27 @@ def save_audio(audio: Tensor, path: Path, sample_rate: int = 32_000):
     if audio.dim() != 2:
         print(f'{audio.shape=}')
 
-    torchaudio.save(str(path), audio, sample_rate=sample_rate)  # type: ignore
+    try:
+        torchaudio.save(str(path), audio, sample_rate=sample_rate)  # type: ignore
+    except (ImportError, RuntimeError):
+        import soundfile as sf
+        sf.write(str(path), audio.T.numpy(), sample_rate)
 
 
 def load_audio(path: Path,
                sample_rate: int = 32_000,
                stereo: bool = False) -> Tensor:
-    audio, orig_sr = torchaudio.load(str(path))  # type: ignore
+    try:
+        audio, orig_sr = torchaudio.load(str(path))  # type: ignore
+    except (ImportError, RuntimeError):
+        import librosa
+        y, orig_sr = librosa.load(str(path), sr=sample_rate, mono=not stereo)
+        audio = torch.from_numpy(y).float()
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+        if stereo and audio.shape[0] == 1:
+            audio = audio.repeat(2, 1)
+        return audio.reshape(1, 1, -1)  # type: ignore
     audio = torchaudio.functional.resample(audio, orig_sr, sample_rate)
     if not stereo:
         audio = to_mono(audio)

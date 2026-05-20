@@ -30,6 +30,7 @@ from stage.utils.sample import eval_decorator, sample_top_k
 from stage import config as cfg
 from stage.inference_config import InferenceConfig
 from stage.models.lm_cache import LmInferenceCache
+from stage.models import lm_autoregressive as ar
 
 
 class LightningMusicgen(L.LightningModule):
@@ -283,12 +284,7 @@ class LightningMusicgen(L.LightningModule):
 
     def _logits_to_next_token(self, logits: Tensor, n_cond_batch: int,
                               inference_cfg: InferenceConfig) -> Tensor:
-        cond_logits, uncond_logits = logits.split(n_cond_batch, dim=0)
-        logits = uncond_logits + (cond_logits -
-                                  uncond_logits) * inference_cfg.cfg_coef
-        logits = logits.permute(0, 1, 3, 2)[..., -1]
-        probs = torch.softmax(logits, dim=-1)
-        return sample_top_k(probs, k=inference_cfg.top_k)
+        return ar.logits_to_next_token(logits, n_cond_batch, inference_cfg)
 
     def sample_next_token(
             self,
@@ -303,7 +299,12 @@ class LightningMusicgen(L.LightningModule):
 
         if kv_cache is not None:
             assert timestep is not None
-            logits = self.lm.decode_step(current_sequence, kv_cache, timestep)
+            logits = self.lm.decode_step(
+                current_sequence,
+                kv_cache,
+                timestep,
+                attention_mask,
+            )
         else:
             logits = self.lm(
                 x=current_sequence,
@@ -317,6 +318,30 @@ class LightningMusicgen(L.LightningModule):
 
         return self._logits_to_next_token(logits, current_sequence.shape[0] //
                                          2, inference_cfg)
+
+    def _autoregressive_lm_loop(
+        self,
+        gen_sequence: Tensor,
+        gen_mask: Tensor,
+        attention_mask: Tensor,
+        start_offset: int,
+        method_to_cond: Dict[ConditioningMethod, EmbeddedCondition],
+        n_samples: int,
+        inference_cfg: InferenceConfig,
+        prog_bar: bool = False,
+    ) -> Tensor:
+        return ar.autoregressive_lm_loop(
+            self.lm,
+            self.special_token,
+            gen_sequence,
+            gen_mask,
+            attention_mask,
+            start_offset,
+            method_to_cond,
+            n_samples,
+            inference_cfg,
+            prog_bar=prog_bar,
+        )
 
     def predict_step(self, batch):
         batch["prog_bar"] = False
@@ -408,57 +433,17 @@ class LightningMusicgen(L.LightningModule):
                              EmbeddedCondition] = self.condition_dispatcher(
                                  processed_conditions)
         inference_cfg = inference_cfg or InferenceConfig()
-        kv_cache: Optional[LmInferenceCache] = None
-        use_kv = inference_cfg.use_kv_cache and start_offset > 0
 
-        if use_kv:
-            prefix = gen_sequence[..., :start_offset]
-            prefix_mask = attention_mask[..., :start_offset]
-            logits, kv_cache = self.lm.prefill(
-                prefix,
-                prefix_mask,
-                cross_attention_input=method_to_cond.get(
-                    ConditioningMethod.CROSS_ATTENTION),
-                prepend_embeds=method_to_cond.get(
-                    ConditioningMethod.INPUT_PREPEND),
-                sum_embeds=method_to_cond.get(ConditioningMethod.INPUT_SUM),
-            )
-            next_token = self._logits_to_next_token(logits, n_samples,
-                                                    inference_cfg)
-            self._write_token_at_offset(gen_sequence, gen_mask, n_samples,
-                                        start_offset, next_token)
-
-        iterator = range(
-            start_offset + 1 if use_kv else start_offset,
-            gen_sequence.shape[-1],
+        gen_sequence = self._autoregressive_lm_loop(
+            gen_sequence,
+            gen_mask,
+            attention_mask,
+            start_offset,
+            method_to_cond,
+            n_samples,
+            inference_cfg,
+            prog_bar=prog_bar,
         )
-        if prog_bar:
-            iterator = tqdm(iterator, desc="generating autoregressively...")
-
-        for offset in iterator:
-            if use_kv and kv_cache is not None:
-                current_sequence = gen_sequence[..., offset - 1:offset]
-                next_token = self.sample_next_token(
-                    current_sequence,
-                    attention_mask[..., offset - 1:offset],
-                    method_to_cond,
-                    inference_cfg=inference_cfg,
-                    kv_cache=kv_cache,
-                    timestep=offset - 1,
-                )
-            else:
-                current_sequence = gen_sequence[..., :offset]
-                current_mask = attention_mask[..., :offset]
-                next_token = self.sample_next_token(
-                    current_sequence,
-                    current_mask,
-                    method_to_cond,
-                    inference_cfg=inference_cfg,
-                )
-            self._write_token_at_offset(gen_sequence, gen_mask, n_samples,
-                                        offset, next_token)
-
-        assert not (gen_sequence == -1).any()
         gen_sequence = gen_sequence[:gen_sequence.shape[0] // 2]
         # assert (gen_sequence == torch.where(
         #     gen_mask[None, ...].expand(n_samples, -1, -1),
@@ -481,15 +466,14 @@ class LightningMusicgen(L.LightningModule):
         offset: int,
         next_token: Tensor,
     ) -> None:
-        valid_mask = gen_mask[..., offset:offset + 1].expand(n_samples, -1, -1)
-        next_token = next_token.clone()
-        next_token[~valid_mask] = self.special_token
-        for batch_slice in (slice(n_samples), slice(n_samples, None)):
-            gen_sequence[batch_slice, :, offset:offset + 1] = torch.where(
-                gen_sequence[batch_slice, :, offset:offset + 1] == -1,
-                next_token,
-                gen_sequence[batch_slice, :, offset:offset + 1],
-            )
+        ar.write_token_at_offset(
+            gen_sequence,
+            gen_mask,
+            n_samples,
+            offset,
+            next_token,
+            self.special_token,
+        )
 
     @staticmethod
     def load_from_checkpoint_replacing_paths(ckp_path: Path | str):

@@ -21,6 +21,9 @@ class LmInferenceCache:
     cross_attention_mask: Optional[Tensor] = None
     sum_embeds_data: Optional[Tensor] = None
 
+    # Key padding mask for cached self-attention (prepend + sequence timesteps)
+    key_valid_mask: Optional[Tensor] = None
+
     def clone_for_cfg(self) -> "LmInferenceCache":
         """Shallow copy; cache tensors are shared (CFG cond/uncond in one batch)."""
         return LmInferenceCache(
@@ -30,6 +33,7 @@ class LmInferenceCache:
             cross_attention_data=self.cross_attention_data,
             cross_attention_mask=self.cross_attention_mask,
             sum_embeds_data=self.sum_embeds_data,
+            key_valid_mask=self.key_valid_mask,
         )
 
 
@@ -43,3 +47,57 @@ def position_for_timestep(
     rel = timestep - first_valid_indices
     pos = (rel + prepend_len).clamp(min=0)
     return pos.view(-1, 1, 1).to(device=device)
+
+
+def trim_kv_cache_intermediates(layer_intermediates: Any, max_seq_len: int) -> None:
+    """Trim cached K/V to the last ``max_seq_len - 1`` positions (x-transformers convention)."""
+    attn = getattr(layer_intermediates, "attn_intermediates", None)
+    if attn is None:
+        return
+    max_cache_len = max_seq_len - 1
+    for inter in attn:
+        cached_kv = getattr(inter, "cached_kv", None)
+        if cached_kv is None:
+            continue
+        k, v = cached_kv
+        if k.shape[-2] > max_cache_len:
+            inter.cached_kv = (
+                k[..., -max_cache_len:, :],
+                v[..., -max_cache_len:, :],
+            )
+
+
+def merge_kv_cache_intermediates(
+    old: Any,
+    new: Any,
+    max_seq_len: Optional[int] = None,
+) -> Any:
+    """Merge KV only when ``new`` holds a single-step delta (older x-transformers builds).
+
+    x-transformers >= 1.26 already stores cumulative K/V in ``cached_kv``; in that case
+    return ``new`` unchanged to avoid double-counting history.
+    """
+    old_attn = getattr(old, "attn_intermediates", None)
+    new_attn = getattr(new, "attn_intermediates", None)
+    if old_attn is None or new_attn is None:
+        return new
+    for old_inter, new_inter in zip(old_attn, new_attn):
+        new_kv = getattr(new_inter, "cached_kv", None)
+        if new_kv is None:
+            continue
+        old_kv = getattr(old_inter, "cached_kv", None)
+        if old_kv is None:
+            new_inter.cached_kv = new_kv
+            continue
+        nk_len = new_kv[0].shape[-2]
+        ok_len = old_kv[0].shape[-2]
+        if nk_len <= 1 and ok_len >= 1:
+            ok, ov = old_kv
+            nk, nv = new_kv
+            new_inter.cached_kv = (
+                torch.cat([ok, nk], dim=-2),
+                torch.cat([ov, nv], dim=-2),
+            )
+    if max_seq_len is not None:
+        trim_kv_cache_intermediates(new, max_seq_len)
+    return new

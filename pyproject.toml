@@ -35,3 +35,8 @@ stage = "stage:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = ["slow: long-running inference tests"]
+testpaths = ["tests"]

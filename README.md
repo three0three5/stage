@@ -32,40 +32,106 @@ To run code in this repo, you need to:
 
 Follow the example in `src/stage/inference.py` to test inference with any model.
 
-## Local inference on Mac (optimized path)
+## Local inference (optimized path)
 
-The repo includes an inference-focused runtime with **KV-cache autoregressive decoding**, automatic **MPS** device selection on Apple Silicon, and optional FP16.
+The repo includes an inference-focused runtime with **KV-cache autoregressive decoding**, automatic device selection (`cuda` → `mps` → `cpu`), and optional FP16.
 
 ```python
 from stage.inference_config import InferenceConfig
 from stage.runtime.inference_engine import StageInferenceEngine
 
 cfg = InferenceConfig(
-    use_kv_cache=True,   # prefill + incremental decode (largest speedup)
-    use_fp16=True,       # recommended on M-series
-    t5_on_cpu=True,      # stable default when LM runs on MPS
-    compile_decode=False,  # set True after first run for extra speed
+    use_kv_cache=True,      # prefill context + incremental decode (recommended)
+    use_fp16=True,          # FP16 on CUDA/MPS; stays FP32 on CPU
+    t5_on_cpu=True,         # keep T5 on CPU when the LM uses MPS/CUDA
+    compile_decode=False,   # torch.compile on decode_step (experimental)
+    device=None,            # None = auto; or "cpu", "cuda", "mps"
 )
 engine = StageInferenceEngine.from_checkpoint("checkpoints/stage-drums.safetensors", cfg)
 audio = engine.generate(n_samples=1, gen_seconds=10, context=wav, description=["heavy rock drums"])
 ```
 
-Benchmark wall time / RTF:
+Pass the same `InferenceConfig` to `LightningMusicgen.generate(..., inference_cfg=cfg)` if you load the model directly.
+
+### `InferenceConfig` fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `cfg_coef` | `3.0` | Classifier-free guidance scale (cond vs uncond logits). |
+| `top_k` | `250` | Top-k sampling for the next codebook token. |
+| `use_kv_cache` | `True` | Prefill the interleaved prefix once, then one `decode_step` per new timestep. Much faster than full-prefix forward each step. |
+| `use_fp16` | `True` | Half precision on GPU/MPS; ignored on CPU (always FP32). |
+| `compile_decode` | `False` | Wrap `MusicgenLm.decode_step` with `torch.compile` (inference engine only). |
+| `t5_on_cpu` | `True` | Run the T5 text encoder on CPU; set `False` only if your checkpoint loads T5 on the same device as the LM. |
+| `device` | `None` | Force device string, or `None` for automatic selection. |
+| `attn_flash` | `None` | Flash attention in the LM decoder: `None` = on except MPS, `True`/`False` to override. |
+| `greedy` | `False` | Argmax instead of top-k (for deterministic tests, not typical listening). |
+| `verify_kv_parity` | `False` | **Debug only:** each KV step also runs a full-prefix forward and resyncs the cache on mismatch. Correct but much slower; leave `False` for production. |
+
+KV decoding applies a **key padding mask** (`self_attn_kv_mask`) on cached attention so interleaved sequences with invalid conditioning timesteps match the masked full forward pass.
+
+### Benchmark CLI
+
+Wall time, steps/s, and real-time factor (RTF):
 
 ```bash
 python -m stage.benchmark_inference --checkpoint checkpoints/stage-drums.safetensors --gen-seconds 10
 ```
 
-Compare with KV-cache disabled:
+Compare KV on vs off (writes `bass_no_kv_*` / `bass_kv_*` under `--output-dir`):
 
 ```bash
-python -m stage.benchmark_inference --no-kv-cache
+python -m stage.benchmark_inference --compare-kv --gen-seconds 1 --output-dir outputs/local_inference
 ```
 
-Run KV-cache parity tests (no weights required):
+Useful flags:
+
+| Flag | Description |
+|------|-------------|
+| `--checkpoint` | Path to `.safetensors` checkpoint (default: `checkpoints/stage-bass.safetensors`). |
+| `--audio` | Context WAV/MP3 for accompaniment generation. |
+| `--context-seconds` | Trim context to the first N seconds. |
+| `--gen-seconds` | Length of generated audio in seconds. |
+| `--output` / `--output-dir` | Save a single WAV or named files per run. |
+| `--compare-kv` | Run once with `use_kv_cache=False`, then `True`. |
+| `--no-kv-cache` | Disable KV cache for a single run. |
+| `--no-fp16` | Force FP32. |
+| `--no-attn-flash` / `--attn-flash` | Disable or force flash attention. |
+| `--t5-on-gpu` | Load T5 on the inference device (required for some bass checkpoints on CPU). |
+| `--device` | `cpu`, `cuda`, or `mps`. |
+| `--null-description` | Use `description=[None]` (no text conditioning). |
+| `--warmup` | Warmup generations before timing (default: 1). |
+
+Example (CPU, short generation, Kaggle-style null description):
 
 ```bash
-python -m pytest tests/test_kv_cache_parity.py -v
+python -m stage.benchmark_inference \
+  --checkpoint checkpoints/stage-bass.safetensors \
+  --audio path/to/context.mp3 \
+  --context-seconds 2 \
+  --gen-seconds 1 \
+  --compare-kv \
+  --null-description \
+  --device cpu \
+  --no-fp16 \
+  --no-attn-flash \
+  --t5-on-gpu \
+  --warmup 0 \
+  --output-dir outputs/local_inference
+```
+
+### Tests
+
+KV-cache parity (tiny LM, no downloaded weights):
+
+```bash
+python -m pytest tests/test_kv_cache_parity.py tests/test_kv_cache_generate_parity.py -v
+```
+
+Micro-benchmark on the tiny LM:
+
+```bash
+python tests/benchmark_kv_cache_lm.py
 ```
 
 

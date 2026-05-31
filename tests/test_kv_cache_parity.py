@@ -188,21 +188,20 @@ def test_kv_cache_matches_full_forward_delayed_mask() -> None:
 
 
 @torch.no_grad()
-def test_kv_mask_stays_aligned_with_cache_past_max_seq_len() -> None:
-    """Regression: self_attn_kv_mask length must match cached K/V (flash-attn)."""
+def test_kv_cache_long_decode_matches_full_forward() -> None:
+    """Long incremental decode: mask/K aligned and logits match full forward (no trim)."""
     torch.manual_seed(4)
     lm = _make_tiny_lm()
-    lm.decoder.max_seq_len = 24  # force trim after ~20 decode steps, not 500
-
     b, k, t = 2, 4, 32
     card = lm.card
     x = _random_batch(b, k, t, card)
     mask = torch.ones(b, t, dtype=torch.bool)
-    prepend_len = 1
     prepend = EmbeddedCondition(
-        data=torch.randn(b, prepend_len, lm.dim),
-        mask=torch.zeros(b, prepend_len, dtype=torch.bool),
+        data=torch.randn(b, 1, lm.dim),
+        mask=torch.zeros(b, 1, dtype=torch.bool),
     )
+
+    full_logits = lm(x, mask, prepend_embeds=prepend)
 
     prefix_len = 14
     _, cache = lm.prefill(
@@ -213,7 +212,7 @@ def test_kv_mask_stays_aligned_with_cache_past_max_seq_len() -> None:
     assert cache.key_valid_mask is not None
 
     for step in range(prefix_len, t):
-        lm.decode_step(
+        step_logits = lm.decode_step(
             x[..., step:step + 1],
             cache,
             timestep=step,
@@ -225,6 +224,12 @@ def test_kv_mask_stays_aligned_with_cache_past_max_seq_len() -> None:
         assert cache.key_valid_mask.shape[-1] == kv_len, (
             f"step {step}: mask {cache.key_valid_mask.shape[-1]} != kv {kv_len}"
         )
+        assert torch.allclose(
+            full_logits[:, :, step:step + 1, :],
+            step_logits,
+            rtol=1e-4,
+            atol=1e-5,
+        ), f"Decode step {step} diverged from full forward"
 
 
 @torch.no_grad()

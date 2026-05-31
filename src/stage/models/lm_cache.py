@@ -81,28 +81,9 @@ def align_key_mask_to_cached_kv(
         f"{target_len} (kv_len={kv_len}, query_len={query_len})")
 
 
-def trim_kv_cache_intermediates(layer_intermediates: Any, max_seq_len: int) -> None:
-    """Trim cached K/V to the last ``max_seq_len - 1`` positions (x-transformers convention)."""
-    attn = getattr(layer_intermediates, "attn_intermediates", None)
-    if attn is None:
-        return
-    max_cache_len = max_seq_len - 1
-    for inter in attn:
-        cached_kv = getattr(inter, "cached_kv", None)
-        if cached_kv is None:
-            continue
-        k, v = cached_kv
-        if k.shape[-2] > max_cache_len:
-            inter.cached_kv = (
-                k[..., -max_cache_len:, :],
-                v[..., -max_cache_len:, :],
-            )
-
-
 def merge_kv_cache_intermediates(
     old: Any,
     new: Any,
-    max_seq_len: Optional[int] = None,
 ) -> Any:
     """Merge KV only when ``new`` holds a single-step delta (older x-transformers builds).
 
@@ -130,6 +111,4 @@ def merge_kv_cache_intermediates(
                 torch.cat([ok, nk], dim=-2),
                 torch.cat([ov, nv], dim=-2),
             )
-    if max_seq_len is not None:
-        trim_kv_cache_intermediates(new, max_seq_len)
     return new

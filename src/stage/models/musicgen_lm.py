@@ -16,7 +16,6 @@ from stage.models.lm_cache import (
     align_key_mask_to_cached_kv,
     cached_kv_seq_len,
     position_for_timestep,
-    trim_kv_cache_intermediates,
 )
 
 
@@ -380,21 +379,13 @@ class MusicgenLm(nn.Module):
     ) -> Union[Tensor, Tuple[Tensor, LmInferenceCache]]:
         layer_cache = cache.layer_intermediates if cache is not None else None
         use_kv = layer_cache is not None
-        max_seq_len = self.decoder.max_seq_len
         query_len = x.shape[-1]
-        if use_kv and layer_cache is not None:
-            trim_kv_cache_intermediates(layer_cache, max_seq_len)
-            max_cache_len = max_seq_len - 1
-            if cache is not None and cache.key_valid_mask is not None:
-                if cache.key_valid_mask.shape[-1] > max_cache_len:
-                    cache.key_valid_mask = cache.key_valid_mask[
-                        :, -max_cache_len:]
-            if kv_key_mask is not None:
-                kv_key_mask = align_key_mask_to_cached_kv(
-                    kv_key_mask,
-                    layer_cache,
-                    query_len,
-                )
+        if use_kv and layer_cache is not None and kv_key_mask is not None:
+            kv_key_mask = align_key_mask_to_cached_kv(
+                kv_key_mask,
+                layer_cache,
+                query_len,
+            )
         # x-transformers: ``mask`` is disallowed with cache; use self_attn_kv_mask instead.
         mask = None if use_kv else attention_mask
 
@@ -420,8 +411,6 @@ class MusicgenLm(nn.Module):
             if use_kv and cache is not None:
                 # x-transformers 1.26+ returns cumulative K/V in cached_kv; assign as-is.
                 cache.layer_intermediates = intermediates
-                trim_kv_cache_intermediates(cache.layer_intermediates,
-                                            max_seq_len)
         else:
             logits = self.decoder(x, mask=mask, **decoder_kwargs)
 
@@ -447,7 +436,6 @@ class MusicgenLm(nn.Module):
             )
             return logits, new_cache
         if use_kv and cache is not None and kv_key_mask is not None:
-            trim_kv_cache_intermediates(cache.layer_intermediates, max_seq_len)
             kv_len = cached_kv_seq_len(cache.layer_intermediates)
             if kv_len is not None:
                 cache.key_valid_mask = kv_key_mask[:, -kv_len:]
